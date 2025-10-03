@@ -3,8 +3,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import httpx
+from fastapi import FastAPI, HTTPException
+import httpx, time
 
 app = FastAPI()
+
+# cache in memory
+cache = {}
+CACHE_TTL = 60  # 1 minute
+
+async def yahoo_last_price(ticker: str):
+    now = time.time()
+
+    # serve from cache if fresh
+    if ticker in cache and now - cache[ticker]["time"] < CACHE_TTL:
+        return cache[ticker]["price"]
+
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Yahoo Finance rate limit hit. Try again shortly.")
+        resp.raise_for_status()
+        data = resp.json()
+
+    price = data["quoteResponse"]["result"][0]["regularMarketPrice"]
+    cache[ticker] = {"price": price, "time": now}
+    return price
+
+@app.get("/")
+async def root():
+    return {"message": "King Maker API is running!"}
+
+@app.get("/stock/{ticker}")
+async def stock_quote(ticker: str):
+    price = await yahoo_last_price(ticker)
+    return {"ticker": ticker, "price": price}
 
 # CORS so the app can call the API from browser/phone
 app.add_middleware(
