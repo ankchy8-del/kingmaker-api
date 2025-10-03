@@ -10,7 +10,6 @@ class Holding(BaseModel):
     qty: float
     avg: float
 
-# In-memory portfolio (replace with DB later)
 portfolio: list[dict] = []
 
 @app.get("/")
@@ -37,7 +36,6 @@ def sync_portfolio(holdings: List[Holding]):
 
 @app.get("/api/signals/live")
 def get_signals():
-    # Simple rule-based signals; replace with real engine later
     res = []
     for p in portfolio:
         last = p.get("last") or p["avg"]
