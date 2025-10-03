@@ -5,7 +5,7 @@ import yfinance as yf
 
 app = FastAPI()
 
-v# --- CORS: allow your app to call this API from the browser ---
+# --- CORS: allow your app to call this API from the browser ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],      # you can tighten later to your domain(s)
