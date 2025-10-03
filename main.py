@@ -2,40 +2,45 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-import yfinance as yf
+import httpx
 
 app = FastAPI()
 
-# --- CORS: allow your app to call this API from the browser ---
+# Allow calls from your web/mobile app (relax now, tighten later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # you can tighten later to your domain(s)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ---------------------------------------------------------------
 
 class Holding(BaseModel):
     ticker: str
     qty: float
     avg: float
 
+# In-memory store (replace with DB later)
 portfolio: list[dict] = []
 
 @app.get("/")
 def root():
     return {"message": "King Maker API is running!"}
 
+async def yahoo_last_price(ticker: str) -> float:
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        result = (data.get("quoteResponse", {}).get("result") or [{}])[0]
+        return float(result.get("regularMarketPrice") or result.get("previousClose") or 0.0)
+
 @app.get("/api/portfolio")
-def get_portfolio():
+async def get_portfolio():
     out = []
     for p in portfolio:
-        try:
-            t = yf.Ticker(p["ticker"])
-            last = float(t.fast_info.last_price or t.fast_info.previous_close or 0)
-        except Exception:
-            last = 0.0
+        last = await yahoo_last_price(p["ticker"])
         out.append({**p, "last": last})
     return out
 
@@ -46,12 +51,12 @@ def sync_portfolio(holdings: List[Holding]):
     return {"status": "ok", "count": len(portfolio)}
 
 @app.get("/api/signals/live")
-def get_signals():
+async def get_signals():
     res = []
     for p in portfolio:
-        last = p.get("last") or p["avg"]
-        avg = p.get("avg") or 0
-        chg = (last - avg) / avg if avg else 0
+        last = await yahoo_last_price(p["ticker"]) or 0.0
+        avg = p.get("avg") or 0.0
+        chg = (last - avg) / avg if avg else 0.0
         if chg >= 0.15:
             res.append({"id": f"{p['ticker']}-trim", "ticker": p["ticker"], "action": "TRIM",
                         "size_pct": 20, "note": "Strong run; reduce risk", "confidence": 0.8})
