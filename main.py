@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict
-import httpx, time
+import httpx, time, csv, io
 
 app = FastAPI()
 
@@ -28,7 +28,62 @@ _cache: Dict[str, Dict] = {}
 CACHE_TTL = 60  # seconds
 
 # ---------- Helper: robust Yahoo quote ----------
-async def yahoo_last_price(ticker: str) -> float:
+from fastapi import HTTPException
+import httpx, time, csv, io
+
+CACHE_TTL = 60
+_cache: dict[str, dict] = {}
+
+async def _yahoo_v7_price(t: str, client: httpx.AsyncClient) -> float | None:
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={t}"
+    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+    if r.status_code == 429:  # rate limit
+        return None
+    r.raise_for_status()
+    data = r.json()
+    result = (data.get("quoteResponse", {}).get("result") or [])
+    if not result:
+        return None
+    q = result[0]
+    price = q.get("regularMarketPrice") or q.get("previousClose")
+    return float(price) if price else None
+
+async def _yahoo_v8_price(t: str, client: httpx.AsyncClient) -> float | None:
+    # last close from intraday chart
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1d&interval=5m"
+    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+    if r.status_code == 429:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    try:
+        closes = (data["chart"]["result"][0]["indicators"]["quote"][0]["close"] or [])
+        # pick last non-null close
+        for v in reversed(closes):
+            if v:
+                return float(v)
+    except Exception:
+        return None
+    return None
+
+async def _stooq_price(t: str, client: httpx.AsyncClient) -> float | None:
+    # Stooq needs lowercase and sometimes different tickers; try direct
+    sym = t.lower()
+    url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
+    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0"})
+    r.raise_for_status()
+    txt = r.text.strip()
+    if "N/D" in txt:  # no data
+        return None
+    f = io.StringIO(txt)
+    reader = csv.DictReader(f)
+    row = next(reader, None)
+    if not row:
+        return None
+    close = row.get("Close")
+    return float(close) if close and close not in ("N/D", "0") else None
+
+async def get_last_price(ticker: str) -> float:
     t = (ticker or "").upper().strip()
     if not t:
         raise HTTPException(status_code=400, detail="Ticker required")
@@ -38,43 +93,51 @@ async def yahoo_last_price(ticker: str) -> float:
     if hit and now - hit["ts"] < CACHE_TTL:
         return hit["price"]
 
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={t}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (KingMaker/1.0)",
-        "Accept": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(url, headers=headers)
-    except httpx.TimeoutException:
-        if hit:  # serve cached value on timeout
-            return hit["price"]
-        raise HTTPException(status_code=504, detail="Upstream timeout")
+    async with httpx.AsyncClient(timeout=8) as client:
+        # 1) Yahoo v7
+        try:
+            p = await _yahoo_v7_price(t, client)
+            if p and p > 0:
+                _cache[t] = {"price": p, "ts": now}
+                return p
+        except httpx.TimeoutException:
+            pass
+        except Exception:
+            pass
 
-    if r.status_code == 429:
-        if hit:
-            return hit["price"]
-        raise HTTPException(status_code=429, detail="Yahoo rate limit; try again soon")
+        # 2) Yahoo v8 chart
+        try:
+            p = await _yahoo_v8_price(t, client)
+            if p and p > 0:
+                _cache[t] = {"price": p, "ts": now}
+                return p
+        except httpx.TimeoutException:
+            pass
+        except Exception:
+            pass
 
-    try:
-        r.raise_for_status()
-        data = r.json()
-        result = (data.get("quoteResponse", {}).get("result") or [])
-        q = result[0] if result else {}
-        price = float(q.get("regularMarketPrice") or q.get("previousClose") or 0.0)
-    except Exception:
-        if hit:
-            return hit["price"]
-        raise HTTPException(status_code=502, detail="Quote parse failed")
+        # 3) Stooq CSV
+        try:
+            p = await _stooq_price(t, client)
+            if p and p > 0:
+                _cache[t] = {"price": p, "ts": now}
+                return p
+        except httpx.TimeoutException:
+            pass
+        except Exception:
+            pass
 
-    if price <= 0.0:
-        if hit:
-            return hit["price"]
-        raise HTTPException(status_code=502, detail="No valid price")
+    # fallback to cache if we had anything
+    if hit:
+        return hit["price"]
 
-    _cache[t] = {"price": price, "ts": now}
-    return price
+    raise HTTPException(status_code=502, detail="No price from providers")
 
+# ---- route using the new helper ----
+@app.get("/stock/{ticker}")
+async def stock_quote(ticker: str):
+    price = await get_last_price(ticker)
+    return {"ticker": ticker.upper(), "price": price}
 # ---------- Routes ----------
 @app.get("/")
 def root():
