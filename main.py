@@ -4,6 +4,23 @@ from pydantic import BaseModel
 from typing import List
 import httpx
 
+@app.get("/stock/{ticker}")
+async def stock_quote(ticker: str):
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        q = (data.get("quoteResponse", {}).get("result") or [{}])[0]
+        return {
+            "ticker": ticker.upper(),
+            "price": float(q.get("regularMarketPrice") or q.get("previousClose") or 0.0),
+            "change": q.get("regularMarketChange"),
+            "changePercent": q.get("regularMarketChangePercent"),
+            "currency": q.get("currency"),
+            "time": q.get("regularMarketTime"),
+        }
+
 app = FastAPI()
 
 # Allow calls from your web/mobile app (relax now, tighten later)
