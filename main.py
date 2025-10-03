@@ -9,36 +9,62 @@ import httpx, time
 app = FastAPI()
 
 # cache in memory
-cache = {}
+_cache: dict[str, dict] = {}
 CACHE_TTL = 60  # 1 minute
 
-async def yahoo_last_price(ticker: str):
+async def yahoo_last_price(ticker: str) -> float:
+    t = ticker.upper()
     now = time.time()
 
     # serve from cache if fresh
-    if ticker in cache and now - cache[ticker]["time"] < CACHE_TTL:
-        return cache[ticker]["price"]
+    hit = _cache.get(t)
+    if hit and now - hit["ts"] < CACHE_TTL:
+        return hit["price"]
 
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url)
-        if resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Yahoo Finance rate limit hit. Try again shortly.")
-        resp.raise_for_status()
-        data = resp.json()
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={t}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; KingMaker/1.0)",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, headers=headers)
+    except httpx.TimeoutException:
+        # fall back to last cached price if any
+        if hit:
+            return hit["price"]
+        raise HTTPException(status_code=504, detail="Upstream timeout")
 
-    price = data["quoteResponse"]["result"][0]["regularMarketPrice"]
-    cache[ticker] = {"price": price, "time": now}
+    if r.status_code == 429:
+        # too many requests; return cached if we have it
+        if hit:
+            return hit["price"]
+        raise HTTPException(status_code=429, detail="Yahoo rate limit; try again shortly")
+
+    try:
+        r.raise_for_status()
+        data = r.json()
+        result = (data.get("quoteResponse", {}).get("result") or [])
+        q = result[0] if result else {}
+        price = float(q.get("regularMarketPrice") or q.get("previousClose") or 0.0)
+    except Exception:
+        # parsing or missing fields
+        if hit:
+            return hit["price"]
+        raise HTTPException(status_code=502, detail="Quote parse failed")
+
+    if price <= 0:
+        # guard against bad zeros
+        if hit:
+            return hit["price"]
+        raise HTTPException(status_code=502, detail="No valid price")
+
+    _cache[t] = {"price": price, "ts": now}
     return price
-
-@app.get("/")
-async def root():
-    return {"message": "King Maker API is running!"}
-
 @app.get("/stock/{ticker}")
 async def stock_quote(ticker: str):
     price = await yahoo_last_price(ticker)
-    return {"ticker": ticker, "price": price}
+    return {"ticker": ticker.upper(), "price": price}
 
 # CORS so the app can call the API from browser/phone
 app.add_middleware(
