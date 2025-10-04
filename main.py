@@ -148,6 +148,69 @@ async def stock_quote(ticker: str):
     price = await yahoo_last_price(ticker)
     return {"ticker": ticker.upper(), "price": price}
 
+@app.get("/batch")
+async def batch_quotes(symbols: str):
+    """
+    Example: /batch?symbols=SMCI,MU,TSLA
+    Returns: {"SMCI": 49.12, "MU": 176.35, "TSLA": 255.02}
+    Uses cache when fresh; otherwise fetches missing tickers in ONE Yahoo call.
+    """
+    if not symbols:
+        raise HTTPException(status_code=400, detail="symbols required")
+
+    tickers: List[str] = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="no valid symbols")
+
+    now = time.time()
+    out: Dict[str, Any] = {}
+    to_fetch: List[str] = []
+
+    # serve cached values where possible
+    for t in tickers:
+        if t in CACHE and (now - CACHE[t]["ts"]) < TTL:
+            out[t] = CACHE[t]["price"]
+        else:
+            to_fetch.append(t)
+
+    if to_fetch:
+        # Yahoo supports multiple symbols in ONE call
+        url = YAHOO_URL.format(",".join(to_fetch))
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # retry a few times for transient 429/5xx
+            for attempt in range(4):
+                r = await client.get(url)
+                if r.status_code == 200:
+                    data = r.json()
+                    results = data.get("quoteResponse", {}).get("result", [])
+                    # map back to requested tickers
+                    got = {}
+                    for item in results:
+                        sym = item.get("symbol")
+                        price = item.get("regularMarketPrice")
+                        if sym and price is not None:
+                            got[sym.upper()] = float(price)
+
+                    # update cache + out
+                    for t in to_fetch:
+                        if t in got:
+                            CACHE[t] = {"price": got[t], "ts": now}
+                            out[t] = got[t]
+                        else:
+                            out[t] = None  # couldn't get a price this round
+                    break
+                elif r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                else:
+                    raise HTTPException(status_code=r.status_code, detail=f"Yahoo error {r.status_code}")
+            else:
+                # ran out of retries: keep whatever cache we had; others -> None
+                for t in to_fetch:
+                    out[t] = out.get(t, None)
+
+    return out
+
 @app.post("/api/portfolio/sync")
 def sync_portfolio(holdings: List[Holding]):
     global portfolio
