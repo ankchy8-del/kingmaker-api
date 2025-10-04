@@ -1,159 +1,78 @@
+# main.py
+import time
+from typing import Dict, Any, List
+
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict
-import httpx, time, csv, io
 
 app = FastAPI()
 
-# CORS
+# CORS for dev and the mobile app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Simple in-memory state ----------
-class Holding(BaseModel):
-    ticker: str
-    qty: float
-    avg: float
+YAHOO_URL = "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}"
 
-portfolio: List[Dict] = []
+# Simple in-memory cache (per process, 60s)
+CACHE: Dict[str, Dict[str, Any]] = {}   # ticker -> {"price": float, "ts": epoch}
+TTL = 60  # seconds
 
-# cache for quotes: { "TICKER": {"price": float, "ts": epoch} }
-_cache: Dict[str, Dict] = {}
-CACHE_TTL = 60  # seconds
 
-# ---------- Helper: robust Yahoo quote ----------
-from fastapi import HTTPException
-import httpx, time, csv, io
+async def yahoo_last_price(ticker: str) -> float:
+    """Fetch single ticker with retries and robust parsing."""
+    url = YAHOO_URL.format(ticker)
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for attempt in range(4):
+            r = await client.get(url)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    results = data.get("quoteResponse", {}).get("result", [])
+                    if not results:
+                        raise ValueError("empty result")
+                    price = results[0].get("regularMarketPrice")
+                    if price is None:
+                        raise ValueError("missing price")
+                    return float(price)
+                except Exception:
+                    # Parsing/structure error
+                    raise HTTPException(status_code=502, detail="Quote parse failed")
+            elif r.status_code in (429, 500, 502, 503, 504):
+                # Backoff and retry
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            else:
+                raise HTTPException(status_code=r.status_code, detail=f"Yahoo error {r.status_code}")
+        raise HTTPException(status_code=429, detail="Upstream rate limited")
 
-CACHE_TTL = 60
-_cache: dict[str, dict] = {}
 
-async def _yahoo_v7_price(t: str, client: httpx.AsyncClient) -> float | None:
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={t}"
-    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
-    if r.status_code == 429:  # rate limit
-        return None
-    r.raise_for_status()
-    data = r.json()
-    result = (data.get("quoteResponse", {}).get("result") or [])
-    if not result:
-        return None
-    q = result[0]
-    price = q.get("regularMarketPrice") or q.get("previousClose")
-    return float(price) if price else None
-
-async def _yahoo_v8_price(t: str, client: httpx.AsyncClient) -> float | None:
-    # last close from intraday chart
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1d&interval=5m"
-    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
-    if r.status_code == 429:
-        return None
-    r.raise_for_status()
-    data = r.json()
-    try:
-        closes = (data["chart"]["result"][0]["indicators"]["quote"][0]["close"] or [])
-        # pick last non-null close
-        for v in reversed(closes):
-            if v:
-                return float(v)
-    except Exception:
-        return None
-    return None
-
-async def _stooq_price(t: str, client: httpx.AsyncClient) -> float | None:
-    # Stooq needs lowercase and sometimes different tickers; try direct
-    sym = t.lower()
-    url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
-    r = await client.get(url, headers={"User-Agent":"Mozilla/5.0"})
-    r.raise_for_status()
-    txt = r.text.strip()
-    if "N/D" in txt:  # no data
-        return None
-    f = io.StringIO(txt)
-    reader = csv.DictReader(f)
-    row = next(reader, None)
-    if not row:
-        return None
-    close = row.get("Close")
-    return float(close) if close and close not in ("N/D", "0") else None
-
-async def get_last_price(ticker: str) -> float:
-    t = (ticker or "").upper().strip()
-    if not t:
-        raise HTTPException(status_code=400, detail="Ticker required")
-
-    now = time.time()
-    hit = _cache.get(t)
-    if hit and now - hit["ts"] < CACHE_TTL:
-        return hit["price"]
-
-    async with httpx.AsyncClient(timeout=8) as client:
-        # 1) Yahoo v7
-        try:
-            p = await _yahoo_v7_price(t, client)
-            if p and p > 0:
-                _cache[t] = {"price": p, "ts": now}
-                return p
-        except httpx.TimeoutException:
-            pass
-        except Exception:
-            pass
-
-        # 2) Yahoo v8 chart
-        try:
-            p = await _yahoo_v8_price(t, client)
-            if p and p > 0:
-                _cache[t] = {"price": p, "ts": now}
-                return p
-        except httpx.TimeoutException:
-            pass
-        except Exception:
-            pass
-
-        # 3) Stooq CSV
-        try:
-            p = await _stooq_price(t, client)
-            if p and p > 0:
-                _cache[t] = {"price": p, "ts": now}
-                return p
-        except httpx.TimeoutException:
-            pass
-        except Exception:
-            pass
-
-    # fallback to cache if we had anything
-    if hit:
-        return hit["price"]
-
-    raise HTTPException(status_code=502, detail="No price from providers")
-
-# ---- route using the new helper ----
-@app.get("/stock/{ticker}")
-async def stock_quote(ticker: str):
-    price = await get_last_price(ticker)
-    return {"ticker": ticker.upper(), "price": price}
-# ---------- Routes ----------
 @app.get("/")
-def root():
+async def root():
     return {"message": "King Maker API is running!"}
 
+
 @app.get("/stock/{ticker}")
 async def stock_quote(ticker: str):
-    price = await yahoo_last_price(ticker)
-    return {"ticker": ticker.upper(), "price": price}
+    t = ticker.upper()
+    now = time.time()
+    if t in CACHE and (now - CACHE[t]["ts"]) < TTL:
+        return {"ticker": t, "price": CACHE[t]["price"], "cached": True}
+    price = await yahoo_last_price(t)
+    CACHE[t] = {"price": price, "ts": now}
+    return {"ticker": t, "price": price, "cached": False}
+
 
 @app.get("/batch")
 async def batch_quotes(symbols: str):
     """
-    Example: /batch?symbols=SMCI,MU,TSLA
+    GET /batch?symbols=SMCI,MU,TSLA
     Returns: {"SMCI": 49.12, "MU": 176.35, "TSLA": 255.02}
-    Uses cache when fresh; otherwise fetches missing tickers in ONE Yahoo call.
+    Uses cache for fresh tickers; fetches missing ones via ONE Yahoo call with retries.
     """
     if not symbols:
         raise HTTPException(status_code=400, detail="symbols required")
@@ -166,7 +85,7 @@ async def batch_quotes(symbols: str):
     out: Dict[str, Any] = {}
     to_fetch: List[str] = []
 
-    # serve cached values where possible
+    # Serve what we can from cache
     for t in tickers:
         if t in CACHE and (now - CACHE[t]["ts"]) < TTL:
             out[t] = CACHE[t]["price"]
@@ -174,79 +93,49 @@ async def batch_quotes(symbols: str):
             to_fetch.append(t)
 
     if to_fetch:
-        # Yahoo supports multiple symbols in ONE call
         url = YAHOO_URL.format(",".join(to_fetch))
         async with httpx.AsyncClient(timeout=8.0) as client:
-            # retry a few times for transient 429/5xx
             for attempt in range(4):
                 r = await client.get(url)
                 if r.status_code == 200:
-                    data = r.json()
-                    results = data.get("quoteResponse", {}).get("result", [])
-                    # map back to requested tickers
-                    got = {}
-                    for item in results:
-                        sym = item.get("symbol")
-                        price = item.get("regularMarketPrice")
-                        if sym and price is not None:
-                            got[sym.upper()] = float(price)
+                    try:
+                        data = r.json()
+                        results = data.get("quoteResponse", {}).get("result", [])
+                        got: Dict[str, float] = {}
+                        for item in results:
+                            sym = (item.get("symbol") or "").upper()
+                            price = item.get("regularMarketPrice")
+                            if sym and price is not None:
+                                got[sym] = float(price)
 
-                    # update cache + out
-                    for t in to_fetch:
-                        if t in got:
-                            CACHE[t] = {"price": got[t], "ts": now}
-                            out[t] = got[t]
-                        else:
-                            out[t] = None  # couldn't get a price this round
-                    break
+                        # Update cache and output; if missing, return None (no crash)
+                        for t in to_fetch:
+                            if t in got:
+                                CACHE[t] = {"price": got[t], "ts": now}
+                                out[t] = got[t]
+                            else:
+                                out[t] = None
+                        break
+                    except Exception:
+                        # Parsing/structure error: set None for those we tried
+                        for t in to_fetch:
+                            out.setdefault(t, None)
+                        break
                 elif r.status_code in (429, 500, 502, 503, 504):
                     time.sleep(0.6 * (attempt + 1))
                     continue
                 else:
-                    raise HTTPException(status_code=r.status_code, detail=f"Yahoo error {r.status_code}")
+                    # Hard error from Yahoo: set None for unfetched, but do not crash
+                    for t in to_fetch:
+                        out.setdefault(t, None)
+                    break
             else:
-                # ran out of retries: keep whatever cache we had; others -> None
+                # Exhausted retries: mark missing as None
                 for t in to_fetch:
-                    out[t] = out.get(t, None)
+                    out.setdefault(t, None)
+
+    # Ensure every requested ticker has a key
+    for t in tickers:
+        out.setdefault(t, None)
 
     return out
-
-@app.post("/api/portfolio/sync")
-def sync_portfolio(holdings: List[Holding]):
-    global portfolio
-    merged: Dict[str, Dict] = {}
-    for h in holdings:
-        T = h.ticker.upper()
-        if T in merged:
-            prev = merged[T]
-            qty_new = prev["qty"] + h.qty
-            avg_new = (prev["qty"] * prev["avg"] + h.qty * h.avg) / qty_new
-            merged[T] = {"ticker": T, "qty": qty_new, "avg": avg_new}
-        else:
-            merged[T] = {"ticker": T, "qty": h.qty, "avg": h.avg}
-    portfolio = list(merged.values())
-    return {"status": "ok", "count": len(portfolio)}
-
-@app.get("/api/portfolio")
-async def get_portfolio():
-    out = []
-    for p in portfolio:
-        last = await yahoo_last_price(p["ticker"])
-        out.append({**p, "last": last})
-    return out
-
-@app.get("/api/signals/live")
-async def get_signals():
-    res = []
-    for p in portfolio:
-        last = await yahoo_last_price(p["ticker"])
-        avg = p.get("avg") or 0.0
-        chg = (last - avg) / avg if avg else 0.0
-        if chg >= 0.15:
-            res.append({"id": f"{p['ticker']}-trim", "ticker": p["ticker"], "action": "TRIM",
-                        "size_pct": 20, "note": "Strong run; reduce risk", "confidence": 0.8})
-        elif chg <= -0.07:
-            res.append({"id": f"{p['ticker']}-add", "ticker": p["ticker"], "action": "BUY",
-                        "size_pct": 10, "note": "Buy the dip; 10% trailing stop", "confidence": 0.74})
-    return res or [{"id": "mu-default", "ticker": "MU", "action": "BUY",
-                    "size_pct": 10, "note": "Momentum setup", "confidence": 0.75}]
