@@ -57,11 +57,11 @@ async def yahoo_fetch(symbols: List[str]) -> Dict[str, Optional[float]]:
         return out
 
 
-# ---------- Stooq helpers ----------
+# Replace _parse_stooq_csv and stooq_fetch with these:
 def _parse_stooq_csv(text: str) -> Dict[str, Optional[float]]:
     """
     Stooq CSV columns: Symbol,Date,Time,Open,High,Low,Close,Volume
-    Return dict upper -> price or None
+    Returns dict {UPPER_SYMBOL: price or None}
     """
     out: Dict[str, Optional[float]] = {}
     f = io.StringIO(text)
@@ -70,25 +70,37 @@ def _parse_stooq_csv(text: str) -> Dict[str, Optional[float]]:
         sym = (row.get("Symbol") or "").upper()
         close = row.get("Close")
         if sym:
+            # Close is "N/D" when not available
             try:
-                # Stooq returns "N/D" when not available
                 out[sym] = None if (close is None or close == "N/D") else float(close)
             except Exception:
                 out[sym] = None
     return out
 
 async def stooq_fetch(symbols: List[str]) -> Dict[str, Optional[float]]:
-    # stooq symbols are lower-case and no exchange suffix
-    url = STOOQ_URL.format(",".join([s.lower() for s in symbols]))
+    """
+    Stooq expects US tickers like aapl.us, tsla.us, mu.us, smci.us
+    We’ll append .us for plain A–Z tickers.
+    """
+    def to_stooq_symbol(s: str) -> str:
+        s_low = s.lower()
+        # If it already has a dot (exchange suffix), leave it; else add .us
+        return s_low if "." in s_low else f"{s_low}.us"
+
+    stooq_syms = [to_stooq_symbol(s) for s in symbols]
+    url = STOOQ_URL.format(",".join(stooq_syms))
+
     out: Dict[str, Optional[float]] = {s: None for s in symbols}
     async with httpx.AsyncClient(timeout=8.0) as client:
         try:
             r = await client.get(url)
             if r.status_code == 200:
-                parsed = _parse_stooq_csv(r.text)
-                # merge back to requested keys
-                for s in symbols:
-                    out[s] = parsed.get(s.upper(), None)
+                parsed = _parse_stooq_csv(r.text)  # keys like TSLA.US, MU.US
+                # map back to the original symbols (upper without .US)
+                for original in symbols:
+                    stooq_key = (to_stooq_symbol(original)).upper()  # TSLA.US
+                    val = parsed.get(stooq_key)
+                    out[original] = val if isinstance(val, (int, float)) else None
                 return out
             else:
                 return out
