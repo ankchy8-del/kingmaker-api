@@ -1,106 +1,74 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os, asyncio, time
-import httpx
+import os, time, httpx
 
-app = FastAPI(title="King Maker API")
+ALPHA_KEY = os.getenv("ALPHAVANTAGE_KEY", "").strip()
+BASE = "https://www.alphavantage.co/query"
 
-# CORS so your Expo app can call this
+app = FastAPI()
+
+# CORS for your phone + Expo
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # set this in Render
-BASE = "https://www.alphavantage.co/query"
+# --- very small in-memory cache to ease rate limits ---
+_cache = {}  # key: ticker, value: (ts, price)
 
-# Simple in-memory cache to reduce API calls and avoid rate limits
-_CACHE: dict[str, tuple[float, float]] = {}  # {ticker_upper: (expiry_ts, price)}
-TTL = 60  # seconds
-
-async def fetch_price_alpha(client: httpx.AsyncClient, ticker: str) -> float | None:
-    """
-    Use Alpha Vantage GLOBAL_QUOTE to fetch a single latest price.
-    Returns float price or None if not available.
-    """
-    if not ALPHA_KEY:
-        raise HTTPException(status_code=500, detail="Missing ALPHA_VANTAGE_KEY")
-
-    # cache
-    key = ticker.upper()
+async def fetch_alpha_price(ticker: str) -> float | None:
+    # return cached within 60s
     now = time.time()
-    if key in _CACHE:
-        exp, px = _CACHE[key]
-        if now < exp:
-            return px
+    hit = _cache.get(ticker.upper())
+    if hit and now - hit[0] < 60:
+        return hit[1]
 
     params = {
         "function": "GLOBAL_QUOTE",
-        "symbol": key,
+        "symbol": ticker.upper(),
         "apikey": ALPHA_KEY,
     }
-    r = await client.get(BASE, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    async with httpx.AsyncClient(timeout=12) as client:
+        r = await client.get(BASE, params=params)
+        r.raise_for_status()
+        data = r.json()
 
-    # Expected structure:
-    # {"Global Quote": {"01. symbol":"SMCI","05. price":"..."}}
-    quote = data.get("Global Quote") or {}
-    price_str = quote.get("05. price")
-
-    if not price_str:
-        return None
-
+    q = data.get("Global Quote") or data.get("GlobalQuote") or {}
+    price_str = q.get("05. price") or q.get("price")
     try:
-        price = float(price_str)
-    except ValueError:
-        return None
+        price = float(price_str) if price_str else None
+    except Exception:
+        price = None
 
-    _CACHE[key] = (now + TTL, price)
+    if price is not None:
+        _cache[ticker.upper()] = (now, price)
     return price
-
 
 @app.get("/")
 async def root():
-    return {"message": "King Maker API is running!"}
-
+    return {"ok": True, "service": "kingmaker-api"}
 
 @app.get("/stock/{ticker}")
-async def stock_quote(ticker: str):
-    try:
-        async with httpx.AsyncClient() as client:
-            px = await fetch_price_alpha(client, ticker)
-        if px is None:
-            raise HTTPException(status_code=404, detail="Price unavailable")
-        return {"symbol": ticker.upper(), "price": px}
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
-
+async def stock(ticker: str):
+    price = await fetch_alpha_price(ticker)
+    if price is None:
+        # upstream limit or no data
+        raise HTTPException(status_code=503, detail="Price unavailable")
+    return {"ticker": ticker.upper(), "price": price}
 
 @app.get("/batch")
-async def batch_quotes(symbols: str = Query(..., description="Comma-separated: e.g. SMCI,MU,TSLA")):
-    # Alpha Vantage free plan doesn’t have a true batch endpoint,
-    # so we fire multiple GLOBAL_QUOTE requests (with caching + concurrency).
-    tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    if not tickers:
-        raise HTTPException(status_code=400, detail="No symbols provided")
-
-    out: dict[str, float | None] = {}
-
-    async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(
-            *[fetch_price_alpha(client, t) for t in tickers],
-            return_exceptions=True
-        )
-
-    for t, res in zip(tickers, results):
-        if isinstance(res, Exception):
-            out[t] = None
-        else:
-            out[t] = res
-
+async def batch(symbols: str):
+    out = {}
+    for t in [s.strip() for s in symbols.split(",") if s.strip()]:
+        try:
+            p = await fetch_alpha_price(t)
+            out[t.upper()] = p
+            # gentle spacing for free tier (5/min, 25/day)
+            await httpx.AsyncClient().aclose()  # no-op, just yield
+            time.sleep(0.5)
+        except Exception:
+            out[t.upper()] = None
     return out
