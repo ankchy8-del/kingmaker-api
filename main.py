@@ -1,101 +1,132 @@
-# main.py
-import os, time, asyncio
-from typing import Dict, Optional, List
+# main.py  (repo root)
+import os
+import time
+from typing import Dict, Optional
+
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-APP = FastAPI()
-APP.add_middleware(
+# ----- Environment configuration -----
+ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY", "").strip()
+if not ALPHA_KEY:
+    raise RuntimeError("Missing env var ALPHA_VANTAGE_KEY")
+
+# gentle defaults; can be overridden in Render Environment
+MIN_GAP_SECONDS = int(os.getenv("MIN_GAP_SECONDS", "15"))     # min time between upstream calls
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))  # keep a fresh price for 2 mins
+
+# ----- App & CORS (so Expo can call it) -----
+app = FastAPI()
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("ALPHAVANTAGE_KEY", "")
-MIN_GAP = int(os.getenv("MIN_GAP_SECONDS", "15"))          # 1 call each 15s (<= 5/min)
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "120"))     # reuse for 2 minutes
+# ----- simple in-memory cache & rate guard -----
+_cache: Dict[str, Dict[str, float]] = {}  # {ticker: {"price": float, "ts": epoch}}
+_last_call_ts: float = 0.0
 
-_cache: Dict[str, Dict[str, float]] = {}                   # {ticker: {"ts": epoch, "price": float}}
-_last_call_ts = 0.0
+async def _alpha_price(ticker: str) -> Optional[float]:
+    """Call Alpha Vantage GLOBAL_QUOTE for one ticker, respecting a minimal spacing between calls."""
+    global _last_call_ts
 
-def _cached(ticker: str) -> Optional[float]:
-    item = _cache.get(ticker)
-    if not item:
-        return None
-    if time.time() - item["ts"] <= CACHE_TTL:
-        return item["price"]
-    return None
+    # throttle upstream calls
+    now = time.time()
+    gap = now - _last_call_ts
+    if gap < MIN_GAP_SECONDS:
+        await _sleep(MIN_GAP_SECONDS - gap)
 
-def _remember(ticker: str, price: float) -> float:
-    _cache[ticker] = {"ts": time.time(), "price": price}
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_KEY}"
+    )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url)
+        if r.status_code == 200:
+            data = r.json() or {}
+            quote = data.get("Global Quote") or {}
+            # Alpha returns price string under "05. price"
+            raw = quote.get("05. price")
+            try:
+                price = float(raw) if raw is not None else None
+            except Exception:
+                price = None
+        else:
+            price = None
+
+    _last_call_ts = time.time()
     return price
 
-async def _respect_rate_limit():
-    global _last_call_ts
-    wait = MIN_GAP - (time.time() - _last_call_ts)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    _last_call_ts = time.time()
+async def _sleep(seconds: float):
+    # tiny awaitable sleep helper without importing asyncio.sleep multiple times
+    import asyncio
+    await asyncio.sleep(max(0.0, seconds))
 
-async def alpha_price(ticker: str) -> Optional[float]:
-    """Fetch one price from Alpha Vantage GLOBAL_QUOTE with rate limiting."""
-    if not API_KEY:
+def _cache_get(ticker: str) -> Optional[float]:
+    row = _cache.get(ticker)
+    if not row:
         return None
+    if time.time() - row["ts"] <= CACHE_TTL_SECONDS:
+        return float(row["price"])
+    # expired
+    _cache.pop(ticker, None)
+    return None
 
-    await _respect_rate_limit()
+def _cache_set(ticker: str, price: Optional[float]):
+    if price is None:
+        return
+    _cache[ticker] = {"price": float(price), "ts": time.time()}
 
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "GLOBAL_QUOTE", "symbol": ticker, "apikey": API_KEY}
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params)
-        # Alpha Vantage returns HTTP 200 even on errors; look at JSON.
-        data = r.json()
-
-    # Too many calls -> they return {"Note": "...frequency..."}
-    if isinstance(data, dict) and ("Note" in data or "Information" in data or "Error Message" in data):
-        return None
-
-    try:
-        price = float(data["Global Quote"]["05. price"])
-        return price
-    except Exception:
-        return None
-
-@APP.get("/")
+# ---------- Routes ----------
+@app.get("/")
 def root():
     return {"ok": True, "service": "kingmaker-api"}
 
-@APP.get("/stock/{ticker}")
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/stock/{ticker}")
 async def stock_quote(ticker: str):
-    ticker = ticker.upper().strip()
-    p = _cached(ticker)
-    if p is not None:
-        return {"ticker": ticker, "price": p, "cached": True}
+    t = ticker.upper().strip()
+    # cached?
+    price = _cache_get(t)
+    if price is not None:
+        return {"ticker": t, "price": price, "cached": True}
 
-    p = await alpha_price(ticker)
-    if p is None:
-        # keep returning “unavailable” instead of 503, so your app doesn’t show red errors
-        raise HTTPException(status_code=200, detail="Price unavailable")
-    return {"ticker": ticker, "price": _remember(ticker, p), "cached": False}
+    # fetch
+    price = await _alpha_price(t)
+    if price is None:
+        raise HTTPException(status_code=503, detail="Price unavailable")
+    _cache_set(t, price)
+    return {"ticker": t, "price": price, "cached": False}
 
-@APP.get("/batch")
-async def batch(symbols: str):
-    tickers: List[str] = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+@app.get("/batch")
+async def batch_quotes(symbols: str = Query(..., description="Comma separated tickers")):
+    # normalize tickers
+    tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     out: Dict[str, Optional[float]] = {}
-    # First return any cached values to be fast
-    for t in tickers:
-        out[t] = _cached(t)
 
-    # Fetch missing ones respecting rate limit
+    # Try cache first
+    need_fetch = []
     for t in tickers:
-        if out[t] is not None:
-            continue
-        p = await alpha_price(t)
-        if p is not None:
-            out[t] = _remember(t, p)
+        c = _cache_get(t)
+        if c is not None:
+            out[t] = c
         else:
             out[t] = None
+            need_fetch.append(t)
+
+    # Fetch missing ones sequentially to respect free limits
+    for t in need_fetch:
+        price = await _alpha_price(t)
+        if price is not None:
+            _cache_set(t, price)
+            out[t] = price
+        else:
+            out[t] = None
+
     return out
