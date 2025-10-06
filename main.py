@@ -1,115 +1,63 @@
-import os, time, json
-from typing import Dict, Optional, List
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
 import httpx
+import os
+import asyncio
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-ALPHA_KEY = (os.getenv("ALPHA_VANTAGE_KEY") or "").strip()
-MIN_GAP = int(os.getenv("MIN_GAP_SECONDS") or 15)
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS") or 120)
+API_KEY = os.getenv("ALPHA_VANTAGE_KEY")
+MIN_GAP_SECONDS = int(os.getenv("MIN_GAP_SECONDS", "15"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 
-print(f"[boot] ALPHA_VANTAGE_KEY present? {'YES' if bool(ALPHA_KEY) else 'NO'}")
-print(f"[boot] MIN_GAP_SECONDS={MIN_GAP}, CACHE_TTL_SECONDS={CACHE_TTL}")
+cache = {}
+last_call_time = 0
 
-_last_call_ts = 0.0
-_cache: Dict[str, Dict] = {}
-
-def _cache_get(sym: str) -> Optional[float]:
-    item = _cache.get(sym.upper())
-    if not item: return None
-    if time.time() - item["ts"] > CACHE_TTL:
-        return None
-    return item["price"]
-
-def _cache_put(sym: str, price: Optional[float]):
-    _cache[sym.upper()] = {"price": price, "ts": time.time()}
-
-async def _respect_gap():
-    global _last_call_ts
-    now = time.time()
-    delta = now - _last_call_ts
-    if delta < MIN_GAP:
-        await asyncio_sleep = __import__("asyncio").sleep
-        await asyncio_sleep(MIN_GAP - delta)
-    _last_call_ts = time.time()
-
-async def _alpha_global_quote(symbol: str) -> Dict:
-    if not ALPHA_KEY:
-        raise HTTPException(status_code=500, detail="Backend missing ALPHA_VANTAGE_KEY")
-    await _respect_gap()
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "GLOBAL_QUOTE", "symbol": symbol.upper(), "apikey": ALPHA_KEY}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
-
-def _extract_price(payload: Dict) -> Optional[float]:
-    # Handle “Note” (rate limit), “Information”, empty payloads
-    if "Note" in payload or "Information" in payload:
-        return None
-    gq = payload.get("Global Quote") or payload.get("GlobalQuote") or {}
-    raw = gq.get("05. price") or gq.get("05-price") or gq.get("price")
-    try:
-        return float(raw) if raw not in (None, "") else None
-    except Exception:
-        return None
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "kingmaker-api"}
 
-@app.get("/alpha_raw")
-async def alpha_raw(symbol: str = Query(..., min_length=1)):
-    """Debug endpoint: see the raw Alpha Vantage JSON."""
-    data = await _alpha_global_quote(symbol)
-    return data
+async def fetch_price(symbol: str):
+    global last_call_time
+
+    # Use cache
+    if symbol in cache and (asyncio.get_event_loop().time() - cache[symbol]['time'] < CACHE_TTL_SECONDS):
+        return cache[symbol]['price']
+
+    # Respect rate limit
+    since_last = asyncio.get_event_loop().time() - last_call_time
+    if since_last < MIN_GAP_SECONDS:
+        await asyncio.sleep(MIN_GAP_SECONDS - since_last)
+
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={API_KEY}"
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url)
+        data = r.json()
+
+    last_call_time = asyncio.get_event_loop().time()
+
+    try:
+        price = float(data["Global Quote"]["05. price"])
+    except Exception:
+        price = None
+
+    cache[symbol] = {"price": price, "time": asyncio.get_event_loop().time()}
+    return price
+
 
 @app.get("/stock/{symbol}")
-async def stock(symbol: str):
-    # cache first
-    cached = _cache_get(symbol)
-    if cached is not None:
-        return {"ticker": symbol.upper(), "price": cached, "cached": True}
-
-    data = await _alpha_global_quote(symbol)
-    price = _extract_price(data)
-
+async def get_stock(symbol: str):
+    price = await fetch_price(symbol)
     if price is None:
-        # Distinguish rate-limit vs no data
-        if "Note" in data or "Information" in data:
-            raise HTTPException(status_code=503, detail="Upstream rate limited")
         raise HTTPException(status_code=404, detail="Price unavailable")
+    return {"symbol": symbol, "price": price}
 
-    _cache_put(symbol, price)
-    return {"ticker": symbol.upper(), "price": price, "cached": False}
 
 @app.get("/batch")
-async def batch(symbols: str):
-    syms: List[str] = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    out = {}
-    for s in syms:
-        cached = _cache_get(s)
-        if cached is not None:
-            out[s] = cached
-            continue
-        data = await _alpha_global_quote(s)
-        price = _extract_price(data)
-        if price is None:
-            out[s] = None
-        else:
-            _cache_put(s, price)
-            out[s] = price
-    return out
+async def get_batch(symbols: str):
+    result = {}
+    for s in symbols.split(","):
+        result[s] = await fetch_price(s.strip())
+    return result
