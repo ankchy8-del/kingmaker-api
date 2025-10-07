@@ -3,6 +3,17 @@ import httpx
 import os
 import asyncio
 
+@app.get("/debug/raw")
+async def debug_raw(symbol: str):
+    """TEMP: return exactly what Alpha Vantage returned (first 2KB)"""
+    import httpx, os
+    API_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={API_KEY}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+    text = r.text
+    return {"status": r.status_code, "length": len(text), "preview": text[:2000]}
+
 app = FastAPI()
 
 API_KEY = os.getenv("ALPHA_VANTAGE_KEY")
